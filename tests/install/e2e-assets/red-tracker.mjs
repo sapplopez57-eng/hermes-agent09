@@ -15,6 +15,7 @@
  * Needs GH_TOKEN (issues: write, actions: read) and GITHUB_REPOSITORY.
  */
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -22,6 +23,16 @@ import { parseArgs } from 'node:util';
 export const LABEL = 'install-e2e-red';
 const RED = new Set(['failure', 'cancelled', 'timed_out', 'startup_failure']);
 const MAX_ROWS = 60;
+
+function isIssuesDisabledError(message) {
+  return /repository has disabled issues|issues are disabled/i.test(message);
+}
+
+async function writeStepSummary(message) {
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  if (!summaryPath) return;
+  await fs.appendFile(summaryPath, `## Install & Update E2E red tracker\n\n${message}\n`);
+}
 
 /**
  * Decide what the tracker does for one completed run. Pure, so the policy is
@@ -57,7 +68,7 @@ export function planTracker(run, jobs, openIssue) {
   const lines = [
     `The scheduled **Install & Update E2E** run ${run.html_url} (\`${run.head_sha.slice(0, 10)}\`, ${run.created_at}) finished **${run.conclusion}** with ${red.length} red leg(s).`,
     '',
-    'This issue is rewritten in place by `.github/workflows/install-e2e-red.yml` after every scheduled run and closed by the first green one. Root-cause each class below; a historical-release limitation that cannot be fixed goes into `tests/install/e2e-assets/known-failures.json`.',
+    'This issue is rewritten in place by `.github/workflows/install-e2e-red.yml` after every scheduled run and closed by the first green one. Root-cause each class below; a historical-release limit is intentionally capped so the body stays readable.',
     '',
     '### Red legs by failure class',
   ];
@@ -85,7 +96,18 @@ async function main() {
   const repo = process.env.GITHUB_REPOSITORY;
   const runId = values['run-id'];
   if (!repo || !runId || !/^\d+$/.test(runId)) throw new Error('need GITHUB_REPOSITORY and a numeric --run-id');
-  const run = JSON.parse(gh(['api', `repos/${repo}/actions/runs/${runId}`]));
+
+  let run;
+  try {
+    run = JSON.parse(gh(['api', `repos/${repo}/actions/runs/${runId}`]));
+  } catch (error) {
+    if (isIssuesDisabledError(String(error))) {
+      await writeStepSummary('Issues are disabled for this repository, so the tracker could not fetch or update GitHub issue state. No tracker issue was created.');
+      return;
+    }
+    throw error;
+  }
+
   const jobs = gh(['api', '--paginate', `repos/${repo}/actions/runs/${runId}/jobs?per_page=100`,
     '--jq', '.jobs[] | {name, conclusion, html_url, steps: [.steps[]? | {name, conclusion}]}'])
     .split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
@@ -94,22 +116,35 @@ async function main() {
   const openIssue = open.length ? { number: open[0].number } : null;
   const plan = planTracker(run, jobs, openIssue);
   console.log(`run ${runId}: conclusion=${run.conclusion} red-legs=${jobs.filter((j) => RED.has(String(j.conclusion))).length} open-tracker=${openIssue ? `#${openIssue.number}` : 'none'} -> ${plan.action}`);
+
   if (values['dry-run'] || plan.action === 'none') {
     if (plan.body) console.log(`\n--- ${plan.title || 'comment'} ---\n${plan.body}`);
     return;
   }
-  if (plan.action === 'open') {
-    gh(['label', 'create', LABEL, '--repo', repo, '--force', '--color', 'B60205',
-      '--description', 'The scheduled install/update E2E matrix is red (managed by install-e2e-red.yml)']);
-    const url = gh(['issue', 'create', '--repo', repo, '--label', LABEL, '--title', String(plan.title), '--body', String(plan.body)]);
-    console.log(`opened ${url.trim()}`);
-  } else if (plan.action === 'update' && openIssue) {
-    gh(['api', '-X', 'PATCH', `repos/${repo}/issues/${openIssue.number}`, '-f', `title=${plan.title}`, '-f', `body=${plan.body}`]);
-    console.log(`updated #${openIssue.number} in place`);
-  } else if (plan.action === 'close' && openIssue) {
-    gh(['issue', 'comment', String(openIssue.number), '--repo', repo, '--body', String(plan.body)]);
-    gh(['issue', 'close', String(openIssue.number), '--repo', repo]);
-    console.log(`closed #${openIssue.number}`);
+
+  try {
+    if (plan.action === 'open') {
+      gh(['label', 'create', LABEL, '--repo', repo, '--force', '--color', 'B60205',
+        '--description', 'The scheduled install/update E2E matrix is red (managed by install-e2e-red.yml)']);
+      const url = gh(['issue', 'create', '--repo', repo, '--label', LABEL, '--title', String(plan.title), '--body', String(plan.body)]);
+      console.log(`opened ${url.trim()}`);
+    } else if (plan.action === 'update' && openIssue) {
+      gh(['api', '-X', 'PATCH', `repos/${repo}/issues/${openIssue.number}`, '-f', `title=${plan.title}`, '-f', `body=${plan.body}`]);
+      console.log(`updated #${openIssue.number} in place`);
+    } else if (plan.action === 'close' && openIssue) {
+      gh(['issue', 'comment', String(openIssue.number), '--repo', repo, '--body', String(plan.body)]);
+      gh(['issue', 'close', String(openIssue.number), '--repo', repo]);
+      console.log(`closed #${openIssue.number}`);
+    }
+  } catch (error) {
+    const message = String(error);
+    if (isIssuesDisabledError(message)) {
+      const summary = 'Issues are disabled for this repository, so the tracker could not create or update the issue. The workflow exits successfully to avoid blocking CI.';
+      console.warn(summary);
+      await writeStepSummary(summary);
+      return;
+    }
+    throw error;
   }
 }
 
